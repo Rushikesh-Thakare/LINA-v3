@@ -1,167 +1,234 @@
 """
 LINA v3 — Intent Router
-Fast-path intent matching that bypasses the LLM for common commands.
-Uses exact match → fuzzy match (difflib) → falls through to LLM.
+Fast-path command matching that bypasses the LLM for well-known phrases.
+
+Matching order (first match wins):
+  1. EXACT_MATCH   — O(1) dict lookup, lowercased + stripped
+  2. REGEX_MATCH   — parameterised patterns (mkdir, search, open URL…)
+  3. FUZZY_MATCH   — difflib.get_close_matches with cutoff=0.78
 """
 
-import difflib
-import logging
+from __future__ import annotations
+
 import re
 import shutil
-import subprocess
+from dataclasses import dataclass, field
+from difflib import get_close_matches
+from typing import Any, Optional
+from urllib.parse import quote_plus
 
-log = logging.getLogger(__name__)
 
-# ── Special sentinel values ────────────────────────────────────────────────────
-INTENT_HELP         = "__HELP__"
-INTENT_HISTORY      = "__SHOW_HISTORY__"
-INTENT_SSH_STATUS   = "__SSH_STATUS__"
-INTENT_WEATHER      = "__WEATHER__"
-INTENT_TIMEZONE     = "__TIMEZONE__"
-INTENT_PKG_CHECK    = "__PKG_CHECK__"
-INTENT_PKG_VERSION  = "__PKG_VERSION__"
-INTENT_LLM_FALLBACK = "__LLM__"   # signal to CommandProcessor to call the LLM
+# ── IntentMatch dataclass ─────────────────────────────────────────────────────
 
-# ── Intent map: phrase → bash command or sentinel ─────────────────────────────
-INTENT_MAP: dict[str, str] = {
-    # Apps
-    "open terminal":       "gnome-terminal &",
-    "launch terminal":     "gnome-terminal &",
-    "start terminal":      "gnome-terminal &",
-    "open browser":        "firefox &",
-    "open firefox":        "firefox &",
-    "open chrome":         "google-chrome &",
-    "open files":          "nautilus &",
-    "open file manager":   "nautilus &",
-    "open calculator":     "gnome-calculator &",
+@dataclass
+class IntentMatch:
+    intent_name: str
+    action: str                         # launch_app | shell_command | open_url | show_help | …
+    params: dict[str, Any] = field(default_factory=dict)
+    confidence: float = 1.0             # 1.0 = exact, 0.78–0.99 = fuzzy
 
-    # Network
-    "what is my ip":       "ip -4 addr show scope global | grep -oE '[0-9]+(\\.[0-9]+){3}' | head -n1",
-    "show ip":             "ip -4 addr show scope global | grep -oE '[0-9]+(\\.[0-9]+){3}' | head -n1",
-    "current ip":          "ip -4 addr show scope global | grep -oE '[0-9]+(\\.[0-9]+){3}' | head -n1",
 
-    # Files
-    "list files":          "ls",
-    "show files":          "ls",
-    "show current folder": "pwd",
-    "where am i":          "pwd",
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-    # Time
-    "current time":        "date",
-    "time now":            "date",
-    "what time is it":     "date",
+def _which_first(*candidates: str) -> str:
+    """Return the first app from candidates found in PATH, or the last as fallback."""
+    for app in candidates:
+        if shutil.which(app):
+            return app
+    return candidates[-1]
 
-    # System health
-    "battery status":      "upower -i $(upower -e | grep BAT | head -n1)",
-    "cpu temperature":     "sensors | grep -E 'temp'",
-    "fan speed":           "sensors | grep -i fan",
-    "network status":      "ip -br addr && ip route",
-    "storage health":      "lsblk -o NAME,SIZE,TYPE,MOUNTPOINT",
-    "disk usage":          "df -h",
-    "memory usage":        "free -h",
-    "top memory processes":"ps -eo pid,comm,%mem --sort=-%mem | head -n10",
-    "top cpu processes":   "ps -eo pid,comm,%cpu --sort=-%cpu | head -n10",
-    "find large files":    "du -ah . | sort -rh | head -n20",
-    "uptime":              "uptime -p",
 
-    # Media (MPRIS)
-    "pause music":         "playerctl pause",
-    "play music":          "playerctl play",
-    "next track":          "playerctl next",
-    "previous track":      "playerctl previous",
+def _app(*candidates: str) -> dict:
+    return {"app": _which_first(*candidates)}
 
-    # Sentinels
-    "what can you do":     INTENT_HELP,
-    "help":                INTENT_HELP,
-    "show history":        INTENT_HISTORY,
-    "command history":     INTENT_HISTORY,
-    "history":             INTENT_HISTORY,
-    "is ssh running":      INTENT_SSH_STATUS,
-    "ssh status":          INTENT_SSH_STATUS,
-    "check ssh":           INTENT_SSH_STATUS,
-    "weather":             INTENT_WEATHER,
-    "timezone":            INTENT_TIMEZONE,
-    "is package installed":INTENT_PKG_CHECK,
-    "package version":     INTENT_PKG_VERSION,
+
+def _cmd(command: str) -> dict:
+    return {"cmd": command}
+
+
+def _url(u: str) -> dict:
+    return {"url": u}
+
+
+# ── EXACT_MATCH table ─────────────────────────────────────────────────────────
+# Keys: lowercase stripped phrases.
+# Values: (action, params_dict)
+
+_EXACT: dict[str, tuple[str, dict]] = {
+
+    # ── App launching ──────────────────────────────────────────────────────────
+    "open terminal":    ("launch_app", _app("gnome-terminal", "konsole", "xfce4-terminal", "tilix")),
+    "open browser":     ("launch_app", _app("firefox", "google-chrome", "chromium")),
+    "open files":       ("launch_app", _app("nautilus", "dolphin", "thunar", "nemo")),
+    "open file manager":("launch_app", _app("nautilus", "dolphin", "thunar", "nemo")),
+    "open calculator":  ("launch_app", _app("gnome-calculator", "kcalc", "galculator")),
+    "open text editor": ("launch_app", _app("gedit", "kate", "mousepad", "xed", "nano")),
+    "open settings":    ("launch_app", _app("gnome-control-center", "systemsettings", "xfce4-settings-manager")),
+
+    # ── System info ────────────────────────────────────────────────────────────
+    "what time is it":  ("shell_command", _cmd("date '+%H:%M, %A %d %B %Y'")),
+    "current time":     ("shell_command", _cmd("date '+%H:%M, %A %d %B %Y'")),
+    "what date is it":  ("shell_command", _cmd("date '+%A, %d %B %Y'")),
+    "what is my ip":    ("shell_command", _cmd("ip -4 addr show scope global | grep -oE '[0-9]+(\\.[0-9]+){3}' | head -n1")),
+    "my ip address":    ("shell_command", _cmd("ip -4 addr show scope global | grep -oE '[0-9]+(\\.[0-9]+){3}' | head -n1")),
+    "list files":       ("shell_command", _cmd("ls -la")),
+    "show files":       ("shell_command", _cmd("ls -la")),
+    "show disk space":  ("shell_command", _cmd("df -h")),
+    "disk usage":       ("shell_command", _cmd("df -h")),
+    "show memory":      ("shell_command", _cmd("free -h")),
+    "memory usage":     ("shell_command", _cmd("free -h")),
+    "battery status":   ("shell_command", _cmd("upower -i $(upower -e | grep BAT | head -n1) 2>/dev/null || cat /sys/class/power_supply/BAT*/capacity 2>/dev/null | head -n1")),
+    "cpu temperature":  ("shell_command", _cmd("sensors 2>/dev/null | grep -E 'temp|Core' || cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | awk '{print $1/1000 \"°C\"}'")),
+    "who am i":         ("shell_command", _cmd("whoami")),
+    "whoami":           ("shell_command", _cmd("whoami")),
+    "network status":   ("shell_command", _cmd("ip -br addr")),
+    "show processes":   ("shell_command", _cmd("ps aux --sort=-%cpu | head -15")),
+    "top processes":    ("shell_command", _cmd("ps aux --sort=-%cpu | head -10")),
+    "uptime":           ("shell_command", _cmd("uptime -p")),
+    "system uptime":    ("shell_command", _cmd("uptime -p")),
+    "hostname":         ("shell_command", _cmd("hostname")),
+    "show hostname":    ("shell_command", _cmd("hostname")),
+    "kernel version":   ("shell_command", _cmd("uname -r")),
+
+    # ── Media ──────────────────────────────────────────────────────────────────
+    "pause music":      ("shell_command", _cmd("playerctl pause 2>/dev/null || echo 'No media player found'")),
+    "play music":       ("shell_command", _cmd("playerctl play 2>/dev/null || echo 'No media player found'")),
+    "stop music":       ("shell_command", _cmd("playerctl stop 2>/dev/null || echo 'No media player found'")),
+    "next track":       ("shell_command", _cmd("playerctl next 2>/dev/null || echo 'No media player found'")),
+    "previous track":   ("shell_command", _cmd("playerctl previous 2>/dev/null || echo 'No media player found'")),
+    "mute":             ("shell_command", _cmd("pactl set-sink-mute @DEFAULT_SINK@ toggle")),
+    "volume up":        ("shell_command", _cmd("pactl set-sink-volume @DEFAULT_SINK@ +10%")),
+    "volume down":      ("shell_command", _cmd("pactl set-sink-volume @DEFAULT_SINK@ -10%")),
+    "increase volume":  ("shell_command", _cmd("pactl set-sink-volume @DEFAULT_SINK@ +10%")),
+    "decrease volume":  ("shell_command", _cmd("pactl set-sink-volume @DEFAULT_SINK@ -10%")),
+
+    # ── Screenshots ────────────────────────────────────────────────────────────
+    "take screenshot":  ("shell_command", _cmd("scrot ~/Desktop/screenshot_$(date +%F_%T).png 2>/dev/null || gnome-screenshot 2>/dev/null")),
+
+    # ── Web ────────────────────────────────────────────────────────────────────
+    "open youtube":     ("open_url", _url("https://www.youtube.com")),
+    "open google":      ("open_url", _url("https://www.google.com")),
+    "open github":      ("open_url", _url("https://www.github.com")),
+    "open gmail":       ("open_url", _url("https://mail.google.com")),
+    "open maps":        ("open_url", _url("https://maps.google.com")),
+    "open reddit":      ("open_url", _url("https://www.reddit.com")),
+    "open wikipedia":   ("open_url", _url("https://www.wikipedia.org")),
+    "open netflix":     ("open_url", _url("https://www.netflix.com")),
+    "open spotify":     ("open_url", _url("https://open.spotify.com")),
+    "open twitter":     ("open_url", _url("https://www.twitter.com")),
+    "open linkedin":    ("open_url", _url("https://www.linkedin.com")),
+
+    # ── LINA meta ──────────────────────────────────────────────────────────────
+    "what can you do":  ("show_help",    {}),
+    "help":             ("show_help",    {}),
+    "lina help":        ("show_help",    {}),
+    "show help":        ("show_help",    {}),
+    "show history":     ("show_history", {}),
+    "command history":  ("show_history", {}),
+    "clear terminal":   ("clear_terminal", {}),
+    "clear screen":     ("clear_terminal", {}),
 }
 
-# ── ASR mishear / noisy-speech heuristics ─────────────────────────────────────
-_HEURISTICS: dict[str, str] = {
-    "least five":           "list files",
-    "list five":            "list files",
-    "what the current site":"current ip",
-    "open browse":          "open browser",
-    "open file":            "open files",
-    "current time now":     "current time",
-}
 
-# ── App fallback table (for multi-DE support) ─────────────────────────────────
-APP_FALLBACKS: dict[str, list[str]] = {
-    "terminal":   ["gnome-terminal", "kgx", "x-terminal-emulator", "konsole",
-                   "xfce4-terminal", "tilix", "mate-terminal"],
-    "browser":    ["firefox", "google-chrome", "chromium"],
-    "files":      ["nautilus", "nemo", "dolphin", "thunar"],
-    "calculator": ["gnome-calculator", "kcalc", "galculator", "qalculate-gtk"],
-}
+# ── REGEX_MATCH table ─────────────────────────────────────────────────────────
+# Each entry: (compiled pattern, intent_name, builder_fn(match) → params, confidence)
 
-# ── Slot-filling regex ────────────────────────────────────────────────────────
-_RE_MKDIR = re.compile(r"^(make|create)\s+(directory|folder)\s+([A-Za-z0-9._-]{1,64})$")
+def _regex_params_mkdir(m: re.Match) -> dict:
+    return {"cmd": f"mkdir -p ~/{m.group(3)}"}
 
+def _regex_params_search(m: re.Match) -> dict:
+    return {"url": f"https://www.google.com/search?q={quote_plus(m.group(1))}"}
+
+def _regex_params_open_domain(m: re.Match) -> dict:
+    domain = m.group(1)
+    prefix = "" if domain.startswith(("http://", "https://")) else "https://"
+    return {"url": f"{prefix}{domain}"}
+
+def _regex_params_service_status(m: re.Match) -> dict:
+    return {"cmd": f"systemctl is-active {m.group(1)}"}
+
+def _regex_params_version(m: re.Match) -> dict:
+    return {"cmd": f"{m.group(3)} --version 2>&1 | head -1"}
+
+def _regex_params_youtube(m: re.Match) -> dict:
+    return {"url": f"https://www.youtube.com/results?search_query={quote_plus(m.group(1))}"}
+
+
+_REGEX: list[tuple[re.Pattern, str, str, Any]] = [
+    # (pattern, intent_name, action, params_builder)
+    (re.compile(r"^(make|create)\s+(directory|folder)\s+([A-Za-z0-9._-]{1,64})$", re.I),
+     "make_directory", "shell_command", _regex_params_mkdir),
+
+    (re.compile(r"^search\s+(?:for\s+)?(.+)$", re.I),
+     "web_search", "open_url", _regex_params_search),
+
+    (re.compile(r"^play\s+(.+)\s+on\s+youtube$", re.I),
+     "youtube_search", "open_url", _regex_params_youtube),
+
+    (re.compile(r"^open\s+([\w.-]+\.(?:com|org|net|io|dev|app|ai))(?:/\S*)?$", re.I),
+     "open_website", "open_url", _regex_params_open_domain),
+
+    (re.compile(r"^is\s+(.+?)\s+running$", re.I),
+     "service_status", "shell_command", _regex_params_service_status),
+
+    (re.compile(r"^(?:what\s+is|show)\s+(?:version\s+of|version)\s+(.+)$", re.I),
+     "app_version", "shell_command", _regex_params_version),
+]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IntentRouter
+# ══════════════════════════════════════════════════════════════════════════════
 
 class IntentRouter:
     """
-    Routes a normalised text command to a bash snippet, sentinel, or INTENT_LLM_FALLBACK.
-
-    Returns:
-        (intent_key: str, value: str)
-        where value is a bash command, sentinel constant, or INTENT_LLM_FALLBACK.
+    Three-strategy intent router.
+    Call match(text) → IntentMatch or None.
+    Returns None when no intent is confident enough → CommandProcessor falls
+    through to the LLM.
     """
 
-    def route(self, raw_text: str) -> tuple[str, str]:
-        normalized = " ".join(raw_text.lower().split())
+    FUZZY_CUTOFF = 0.78
+    _exact_keys  = list(_EXACT.keys())
 
-        # 1 — Heuristics (known ASR mishears)
-        if normalized in _HEURISTICS:
-            normalized = _HEURISTICS[normalized]
+    def match(self, text: str) -> Optional[IntentMatch]:
+        normalised = text.strip().lower()
 
-        # 2 — Exact match
-        if normalized in INTENT_MAP:
-            return normalized, INTENT_MAP[normalized]
+        # 1) Exact match ───────────────────────────────────────────────────────
+        if normalised in _EXACT:
+            action, params = _EXACT[normalised]
+            return IntentMatch(
+                intent_name=normalised,
+                action=action,
+                params=dict(params),     # copy so callers can modify
+                confidence=1.0,
+            )
 
-        # 3 — Fuzzy match (difflib cutoff 0.78)
-        known = list(INTENT_MAP.keys())
-        matches = difflib.get_close_matches(normalized, known, n=1, cutoff=0.78)
-        if matches:
-            key = matches[0]
-            return key, INTENT_MAP[key]
+        # 2) Regex match ────────────────────────────────────────────────────────
+        for pattern, intent_name, action, builder in _REGEX:
+            m = pattern.match(normalised)
+            if m:
+                return IntentMatch(
+                    intent_name=intent_name,
+                    action=action,
+                    params=builder(m),
+                    confidence=0.95,
+                )
 
-        # 4 — Slot: mkdir / create folder
-        m = _RE_MKDIR.match(normalized)
-        if m:
-            dirname = m.group(3)
-            return "mkdir", f"mkdir '{dirname}'"
+        # 3) Fuzzy match ────────────────────────────────────────────────────────
+        close = get_close_matches(normalised, self._exact_keys, n=1, cutoff=self.FUZZY_CUTOFF)
+        if close:
+            best_key = close[0]
+            action, params = _EXACT[best_key]
+            return IntentMatch(
+                intent_name=best_key,
+                action=action,
+                params=dict(params),
+                confidence=0.80,
+            )
 
-        # 5 — Search
-        if normalized.startswith("search for "):
-            query = normalized[11:].strip().replace(" ", "+")
-            return "search", f"xdg-open 'https://www.google.com/search?q={query}'"
-
-        # 6 — Falls through to LLM
-        return "llm", INTENT_LLM_FALLBACK
-
-    @staticmethod
-    def which_first(candidates: list[str]) -> str | None:
-        """Return the first candidate that exists on PATH."""
-        for app in candidates:
-            if shutil.which(app):
-                return app
         return None
 
-    @staticmethod
-    def launch_gui(app: str) -> tuple[bool, str]:
-        """Non-blocking GUI app launch."""
-        try:
-            subprocess.Popen([app], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return True, f"Launched {app}"
-        except Exception as exc:
-            return False, str(exc)
+
+# ── Legacy INTENT_MAP alias (keeps autocomplete in main_window.py working) ───
+INTENT_MAP: dict[str, str] = {k: v[0] for k, v in _EXACT.items()}

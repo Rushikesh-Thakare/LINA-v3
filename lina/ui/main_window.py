@@ -41,15 +41,24 @@ log = logging.getLogger(__name__)
 class _ProcessWorker(QThread):
     """
     Runs CommandProcessor.process() off the main thread.
-    Emits result_ready when done.
+    Bridges CommandProcessor callbacks → Qt signals (thread-safe QueuedConnection).
     """
     from PyQt5.QtCore import pyqtSignal
-    result_ready = pyqtSignal(dict)
+    result_ready    = pyqtSignal(dict)
+    terminal_output = pyqtSignal(str)   # on_output callback → UI terminal
+    speak_text      = pyqtSignal(str)   # on_speak  callback → TTS
+    status_update   = pyqtSignal(str)   # on_status callback → status bar
 
     def __init__(self, processor: CommandProcessor, command: str, parent=None):
         super().__init__(parent)
         self._processor = processor
-        self._command = command
+        self._command   = command
+        # Wire callbacks → signals so they cross the thread boundary safely
+        self._processor.set_callbacks(
+            on_output=lambda text: self.terminal_output.emit(text),
+            on_speak =lambda text: self.speak_text.emit(text),
+            on_status=lambda text: self.status_update.emit(text),
+        )
 
     def run(self):
         result = self._processor.process(self._command)
@@ -74,6 +83,7 @@ class MainWindow(QMainWindow):
 
         # ── Brain / history ───────────────────────────────────────────────────
         self._processor = CommandProcessor()
+        self._processor.paranoid_mode = self.paranoid_mode  # sync from saved settings
         self._history   = HistoryManager()
         self._tts       = TTSManager(self)     # single TTS queue — cancels on new speech
         self._active_threads: list[QThread] = []  # keep references alive
@@ -272,10 +282,14 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str)
     def _on_command_received(self, command: str):
-        self._terminal_print(f"\n▶ {command}")
-        self._update_status("Processing…")
+        self._terminal_print(f"\n\u25b6 {command}")
+        self._update_status("Processing\u2026")
 
         worker = _ProcessWorker(self._processor, command, self)
+        # Bridge worker signals → main-thread slots
+        worker.terminal_output.connect(self._terminal_print,  Qt.QueuedConnection)
+        worker.speak_text.connect(self._speak,                Qt.QueuedConnection)
+        worker.status_update.connect(self._update_status,     Qt.QueuedConnection)
         worker.result_ready.connect(self._on_result)
         worker.finished.connect(lambda: self._safe_remove_thread(worker))
         worker.start()
@@ -283,21 +297,16 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(dict)
     def _on_result(self, result: dict):
-        explanation = result.get("explanation", "")
-        status      = result.get("status", "ok")
-
-        if result.get("script"):
-            self._terminal_print(f"$ {result['script']}")
-        if result.get("output"):
-            self._terminal_print(result["output"].strip())
-        if explanation:
-            self._terminal_print(f"💬 LINA: {explanation}")
-
-        self._update_status("Idle" if status == "ok" else status.capitalize())
+        """Final result handler — just updates history pane and status.
+        Terminal output and TTS are already fired by callbacks during processing.
+        """
+        status = result.get("status", "ok")
+        # Log to history pane
         self._history_print(json.dumps(result, ensure_ascii=False))
-
-        if explanation and status == "ok":
-            self._speak(explanation)
+        # Handle clear_terminal meta-action
+        if result.get("type") == "clear_terminal":
+            self._clear_terminal()
+        self._update_status("Idle" if status == "ok" else status.capitalize())
 
     def _on_manual_command(self):
         text = self.cmd_input.text().strip()
