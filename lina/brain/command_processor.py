@@ -419,8 +419,8 @@ class CommandProcessor:
 
     def _log_history(self, command: str) -> None:
         try:
-            from datetime import datetime
-            self.history.log({"command": command, "ts": datetime.utcnow().isoformat() + "Z"})
+            from datetime import datetime, timezone
+            self.history.log({"command": command, "ts": datetime.now(timezone.utc).isoformat()})
         except Exception:
             pass
 

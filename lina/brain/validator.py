@@ -41,9 +41,12 @@ _WARN  = ValidationResult(is_safe=True,  blocked_reason="", risk_level=RiskLevel
 # ── Pattern tables ────────────────────────────────────────────────────────────
 
 # BLOCKED — always rejected, no exceptions
-_BLOCKED_PATTERNS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"rm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+|--force\s+)?-[a-zA-Z]*r[a-zA-Z]*\s+[/\"']*\s*[\"']?\s*$", re.I),
-     "Recursive delete on root (rm -rf /)"),
+# NOTE on rm pattern: matches "rm -rf /" AND "rm -rf /*" (wildcard root wipe)
+# NOTE on chmod: \b doesn't work after "/" (not a word char) — use end-anchor instead
+_BLOCKED_PATTERNS = [
+    # rm -rf / or rm -rf /* (root filesystem wipe, with or without glob)
+    (re.compile(r"rm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+|--force\s+)?-[a-zA-Z]*r[a-zA-Z]*\s+['\"]?/\*?['\"]?\s*$", re.I),
+     "Recursive delete on root (rm -rf / or rm -rf /*)"),
     (re.compile(r"rm\s+.*--no-preserve-root", re.I),
      "Dangerous rm with --no-preserve-root"),
     (re.compile(r"\bmkfs\b", re.I),
@@ -54,7 +57,8 @@ _BLOCKED_PATTERNS: list[tuple[re.Pattern, str]] = [
      "Writing directly to block device is not allowed"),
     (re.compile(r"\bcryptsetup\b", re.I),
      "Disk encryption commands are not allowed"),
-    (re.compile(r"\bchmod\s+777\s+/\b", re.I),
+    # chmod 777 / — matches "chmod 777 /" at end of string or followed by whitespace
+    (re.compile(r"\bchmod\s+777\s+/(\s|$)", re.I),
      "Changing root permissions is not allowed"),
     (re.compile(r"\b(useradd|userdel|usermod|groupadd|groupdel)\b", re.I),
      "User/group management is not allowed"),
@@ -80,7 +84,7 @@ _BLOCKED_PATTERNS: list[tuple[re.Pattern, str]] = [
 ]
 
 # HIGH_RISK — allowed but emit warning
-_HIGH_RISK_PATTERNS: list[tuple[re.Pattern, str]] = [
+_HIGH_RISK_PATTERNS = [
     (re.compile(r"\bsudo\b", re.I),
      "Command uses sudo (elevated privileges)"),
     (re.compile(r"\bsystemctl\s+(stop|disable|mask|kill)\b", re.I),
@@ -102,7 +106,7 @@ _HIGH_RISK_PATTERNS: list[tuple[re.Pattern, str]] = [
 ]
 
 # LOW_RISK — allowed, logged
-_LOW_RISK_PATTERNS: list[tuple[re.Pattern, str]] = [
+_LOW_RISK_PATTERNS = [
     (re.compile(r"\b(curl|wget|ping|nc|ncat|netcat)\b", re.I),
      "Network access command"),
     (re.compile(r">>?\s*/(?!dev/null)", re.I),

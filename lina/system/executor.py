@@ -151,3 +151,16 @@ class ScriptExecutor:
         except Exception as exc:
             log.error("Failed to open URL %s: %s", url, exc)
             return False
+
+    def run(self, script: str, timeout: int = 10) -> str:
+        """
+        Backward-compatible shim around run_shell().
+        Returns combined stdout+stderr as a plain string (what command_processor expects).
+        """
+        result = self.run_shell(script, timeout=timeout)
+        return result.output
+
+
+# ── Backward-compatible alias —————————————————————————————————————————————————
+Executor = ScriptExecutor
+

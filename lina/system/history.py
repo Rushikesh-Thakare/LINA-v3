@@ -154,3 +154,21 @@ class HistoryManager:
             log.info("History cleared.")
         except Exception as exc:
             log.error("Failed to clear history: %s", exc)
+
+    # ── Compatibility aliases ─────────────────────────────────────────────────
+    def recent(self, n: int) -> list[str]:
+        """
+        Alias used by main_window.py and _handle_history().
+        Returns last N commands as formatted strings (not dataclass instances).
+        """
+        entries = self.last_n(n)
+        result = []
+        for e in entries:
+            ts = e.timestamp[:19].replace("T", " ") if e.timestamp else "?"
+            result.append(f"[{ts}] {e.command}")
+        return result
+
+    def cleanup(self) -> None:
+        """Alias for cleanup_old() — called by main_window.py on startup."""
+        self.cleanup_old()
+
