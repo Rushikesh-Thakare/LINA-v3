@@ -31,7 +31,6 @@ def _env_int(key: str, default: int = 0) -> int:
         return default
 
 # ── API Keys ──────────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY: str = _env("ANTHROPIC_API_KEY")
 GROQ_API_KEY: str      = _env("GROQ_API_KEY")
 
 # ── Whisper (STT) ─────────────────────────────────────────────────────────────
@@ -81,7 +80,6 @@ MAX_RECORDING_SECONDS: float   = _env_float("MAX_RECORDING_SECONDS", 10.0)
 SILENCE_THRESHOLD_SECONDS: float = _env_float("SILENCE_THRESHOLD_SECONDS", 1.5)
 
 # ── LLM models ────────────────────────────────────────────────────────────────
-CLAUDE_MODEL: str = _env("CLAUDE_MODEL", "claude-haiku-4-5")
 GROQ_MODEL: str   = _env("GROQ_MODEL",   "llama-3.1-8b-instant")
 
 # ── App info ──────────────────────────────────────────────────────────────────
@@ -104,15 +102,11 @@ def validate_config() -> tuple[bool, list[str]]:
     """
     Check that critical settings are present and coherent.
     Returns (is_valid: bool, errors: list[str]).
-    An app can start with warnings, but errors are shown in the UI.
     """
     errors: list[str] = []
 
-    if not ANTHROPIC_API_KEY and not GROQ_API_KEY:
-        errors.append("No LLM API key set — add ANTHROPIC_API_KEY or GROQ_API_KEY to .env")
-
-    if ANTHROPIC_API_KEY and not ANTHROPIC_API_KEY.startswith("sk-ant-"):
-        errors.append("ANTHROPIC_API_KEY looks invalid (should start with 'sk-ant-')")
+    if not GROQ_API_KEY:
+        errors.append("GROQ_API_KEY not set — add it to .env  (free key: https://console.groq.com)")
 
     if not PIPER_ONNX_PATH.exists():
         errors.append(

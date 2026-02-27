@@ -12,8 +12,7 @@ PyQt5>=5.15
 # Speech-to-Text (offline, fast)
 faster-whisper>=1.0.0
 
-# AI Brain
-anthropic>=0.40.0
+# AI Brain — Groq (llama-3.1-8b-instant, free tier)
 groq>=0.11.0
 
 # Audio

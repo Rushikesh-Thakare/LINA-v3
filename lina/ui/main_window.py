@@ -31,7 +31,7 @@ from lina.config import (
 from lina.ui.styles import DARK_THEME, LIGHT_THEME
 from lina.voice.wake_word_thread import WakeWordThread
 from lina.voice.stt_thread import STTThread
-from lina.voice.tts_thread import TTSThread
+from lina.voice.tts_thread import TTSThread, TTSManager
 from lina.brain.command_processor import CommandProcessor
 from lina.system.history import HistoryManager
 
@@ -75,6 +75,7 @@ class MainWindow(QMainWindow):
         # ── Brain / history ───────────────────────────────────────────────────
         self._processor = CommandProcessor()
         self._history   = HistoryManager()
+        self._tts       = TTSManager(self)     # single TTS queue — cancels on new speech
         self._active_threads: list[QThread] = []  # keep references alive
 
         # ── Build UI ──────────────────────────────────────────────────────────
@@ -309,14 +310,10 @@ class MainWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _speak(self, text: str):
-        """Always creates a new TTSThread — never reuses."""
+        """Delegate to TTSManager — cancels any current speech, speaks immediately."""
         self._update_status("Speaking…")
-        tts = TTSThread(text, self)
-        tts.finished_speaking.connect(lambda: self._update_status("Idle"))
-        tts.finished_speaking.connect(lambda: self._safe_remove_thread(tts))
-        tts.finished.connect(lambda: self._safe_remove_thread(tts))
-        tts.start()
-        self._active_threads.append(tts)
+        self._tts.speaking_finished.connect(lambda: self._update_status("Idle"))
+        self._tts.speak(text)
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Status / Terminal helpers
@@ -479,6 +476,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Request graceful shutdown of all running threads."""
+        self._tts.stop()
         for t in list(self._active_threads):
             if t.isRunning():
                 t.requestInterruption()

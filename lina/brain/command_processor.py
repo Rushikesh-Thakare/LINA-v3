@@ -43,43 +43,17 @@ class CommandProcessor:
         self.distro    = detect_distro()
         self._llm      = None   # lazy-loaded on first LLM call
         self._llm_name = None
+        self._cmd_history: list[str] = []   # last N commands for LLM context
 
-    # ── LLM: Groq primary (free), Claude optional fallback ────────────────────
-    def _get_llm(self, *, reset: bool = False):
-        """Return cached LLM. Groq (llama-3.1-8b-instant) is primary — free tier."""
-        if self._llm is not None and not reset:
-            return self._llm
-        # Always try Groq first — it's free
-        try:
-            from lina.brain.llm_groq import GroqLLM
-            self._llm = GroqLLM()
-            self._llm_name = "groq"
-            log.info("Using Groq (llama-3.1-8b-instant) as primary LLM.")
-            return self._llm
-        except Exception as exc:
-            log.warning("Groq init failed (%s) — trying Claude.", exc)
-
-        # Claude fallback (only if key is set)
-        try:
-            from lina.config import ANTHROPIC_API_KEY
-            if not ANTHROPIC_API_KEY:
-                raise ValueError("ANTHROPIC_API_KEY not set")
-            from lina.brain.llm_claude import ClaudeLLM
-            self._llm = ClaudeLLM()
-            self._llm_name = "claude"
-            log.info("Using Claude as fallback LLM.")
-        except Exception as exc:
-            raise RuntimeError("No LLM available. Set GROQ_API_KEY in .env.") from exc
+    # ── LLM: Groq / llama-3.1-8b-instant (sole backend) ──────────────────────
+    def _get_llm(self):
+        """Lazy-load and cache the LLMService (Groq llama-3.1-8b-instant)."""
+        if self._llm is None:
+            from lina.brain.llm_claude import LLMService
+            self._llm = LLMService()
+            self._llm_name = "llama"
+            log.info("LLMService ready (Groq llama-3.1-8b-instant).")
         return self._llm
-
-    def _call_with_fallback(self, method: str, *args):
-        """Call llm.<method>(*args). Raises if Groq fails (Claude removed — no credits)."""
-        llm = self._get_llm()
-        try:
-            return getattr(llm, method)(*args)
-        except Exception as exc:
-            log.error("Groq LLM error: %s", exc)
-            raise
 
     # ── Main public method ────────────────────────────────────────────────────
     def process(self, command: str) -> dict:
@@ -164,7 +138,24 @@ class CommandProcessor:
 
     def _handle_llm(self, command: str, result: dict) -> dict:
         result["type"] = "llm"
-        script, description = self._call_with_fallback("generate_bash_script", command, self.distro)
+        # Track command history for LLM context (last 10 kept)
+        self._cmd_history.append(command)
+        self._cmd_history = self._cmd_history[-10:]
+
+        llm = self._get_llm()
+        # Pass history_context if the LLM supports it (ClaudeService does)
+        if hasattr(llm, "generate_bash_script"):
+            import inspect
+            sig = inspect.signature(llm.generate_bash_script)
+            if "history_context" in sig.parameters:
+                script, description = llm.generate_bash_script(
+                    command, self.distro, self._cmd_history[:-1]
+                )
+            else:
+                script, description = llm.generate_bash_script(command, self.distro)
+        else:
+            raise RuntimeError("LLM has no generate_bash_script method")
+
         result["script"] = script
 
         safe, reason = self.validator.validate(script)
@@ -174,7 +165,7 @@ class CommandProcessor:
             return result
 
         output = self.executor.run(script)
-        explanation = self._call_with_fallback("interpret_output", command, output)
+        explanation = llm.interpret_output(command, output)
         result.update({"output": output, "explanation": explanation})
         self.history.log({**result, "ts": _now()})
         return result
